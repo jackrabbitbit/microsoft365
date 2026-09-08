@@ -430,10 +430,23 @@ def test_on_es_poll_does_not_unwrap_jmr_messages_unless_enabled(mocker):
 
 
 def test_on_es_poll_uses_jmr_original_email_when_enabled(mocker):
+    raw_wrapper = b"Message-ID: <JMR.report@microsoft.com>\n\nWrapper body"
+    raw_original = b"original raw email"
+    wrapper_email = _email("one", "2026-07-16T01:00:00Z")
+    wrapper_email["from"]["emailAddress"]["address"] = "reporter@example.com"
     helper = Mock()
     helper.make_rest_call_helper.side_effect = [
-        {"value": [_email("one", "2026-07-16T01:00:00Z")]},
-        b"Message-ID: <JMR.report@microsoft.com>\n\nWrapper body",
+        {"value": [wrapper_email]},
+        raw_wrapper,
+        {
+            "value": [
+                {
+                    "@odata.type": "#microsoft.graph.itemAttachment",
+                    "id": "attachment-one",
+                }
+            ]
+        },
+        raw_original,
     ]
     mocker.patch.object(app_module, "MsGraphHelper", return_value=helper)
 
@@ -465,20 +478,18 @@ def test_on_es_poll_uses_jmr_original_email_when_enabled(mocker):
         },
     )
     reporter = app_module.FindingEmailReporter(
-        from_="sender@example.com",
-        to="recipient@example.com",
-        cc="copied@example.com",
-        subject="Original subject",
-        message_id="<original-message@example.com>",
-        id="original-network-id",
-        body="Original body",
-        date="Thu, 20 Aug 2026 10:00:00 +0000",
+        from_="reporter@example.com",
+        to="mailbox@example.com",
+        subject="Wrapper subject",
+        message_id="<JMR.report@microsoft.com>",
+        id="one",
+        body="Wrapper body",
     )
     mocker.patch.object(app_module, "extract_email_data", return_value=outer)
     jmr_extract = mocker.patch.object(
         app_module,
         "_extract_jmr_inner_email",
-        return_value=(original, reporter, b"original raw email"),
+        return_value=(original, reporter, raw_original),
     )
     generic_extract = mocker.patch.object(app_module, "_extract_inner_email")
 
@@ -496,18 +507,70 @@ def test_on_es_poll_uses_jmr_original_email_when_enabled(mocker):
     assert findings[0].email.body == "Original body"
     assert findings[0].email.urls == ["https://example.test/original"]
     assert findings[0].email.reporter.model_dump(by_alias=True) == {
-        "from": "sender@example.com",
-        "to": "recipient@example.com",
-        "cc": "copied@example.com",
+        "from": "reporter@example.com",
+        "to": "mailbox@example.com",
+        "cc": None,
         "bcc": None,
-        "subject": "Original subject",
-        "message_id": "<original-message@example.com>",
-        "id": "original-network-id",
-        "body": "Original body",
-        "date": "Thu, 20 Aug 2026 10:00:00 +0000",
+        "subject": "Wrapper subject",
+        "message_id": "<JMR.report@microsoft.com>",
+        "id": "one",
+        "body": "Wrapper body",
+        "date": None,
     }
     assert len(findings[0].attachments) == 1
-    assert findings[0].attachments[0].data == b"original raw email"
+    assert findings[0].attachments[0].data == raw_original
     assert findings[0].attachments[0].is_raw_email
-    jmr_extract.assert_called_once()
+    jmr_extract.assert_called_once_with(raw_wrapper, raw_original, outer, "one")
+    assert helper.make_rest_call_helper.call_count == 4
+    download_call = helper.make_rest_call_helper.call_args_list[-1]
+    assert download_call.args[0].endswith(
+        "/messages/one/attachments/attachment-one/$value"
+    )
+    assert download_call.kwargs == {"download": True}
+    generic_extract.assert_not_called()
+
+
+def test_on_es_poll_falls_back_to_wrapper_when_jmr_original_is_invalid(mocker):
+    raw_wrapper = b"Message-ID: <JMR.report@microsoft.com>\n\nWrapper body"
+    helper = Mock()
+    helper.make_rest_call_helper.side_effect = [
+        {"value": [_email("one", "2026-07-16T01:00:00Z")]},
+        raw_wrapper,
+        {
+            "value": [
+                {
+                    "@odata.type": "#microsoft.graph.itemAttachment",
+                    "id": "attachment-one",
+                }
+            ]
+        },
+        b"invalid original",
+    ]
+    mocker.patch.object(app_module, "MsGraphHelper", return_value=helper)
+
+    outer = SimpleNamespace(
+        body=SimpleNamespace(plain_text="Wrapper body", html=None),
+        urls=[],
+        attachments=[],
+        headers=SimpleNamespace(subject="Wrapper subject", date=None),
+        to_dict=lambda: {"headers": {"subject": "Wrapper subject"}},
+    )
+    mocker.patch.object(app_module, "extract_email_data", return_value=outer)
+    jmr_extract = mocker.patch.object(
+        app_module, "_extract_jmr_inner_email", return_value=None
+    )
+    generic_extract = mocker.patch.object(app_module, "_extract_inner_email")
+    asset = _asset(unwrap_jmr_reported_message=True)
+
+    findings = list(app_module.on_es_poll.__wrapped__(Mock(), Mock(), asset))
+
+    assert len(findings) == 1
+    assert findings[0].email.headers == {"subject": "Wrapper subject"}
+    assert findings[0].email.body == "Wrapper body"
+    assert len(findings[0].attachments) == 1
+    assert findings[0].attachments[0].data == raw_wrapper
+    assert findings[0].attachments[0].is_raw_email
+    assert asset.ingest_state["es_last_time"] == "2026-07-16T01:00:00Z"
+    assert asset.ingest_state["es_boundary_ids"] == ["one"]
+    jmr_extract.assert_called_once_with(raw_wrapper, b"invalid original", outer, "one")
     generic_extract.assert_not_called()

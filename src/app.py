@@ -912,8 +912,51 @@ def _get_original_email_id(inner_message: Message) -> str | None:
     return None
 
 
+def _download_jmr_original_email(
+    helper: MsGraphHelper, email_address: str, email_id: str | None
+) -> bytes | None:
+    """Download the MIME source for a JMR wrapper's unique message attachment."""
+    if not email_id:
+        return None
+
+    message_endpoint = (
+        f"/users/{email_address}/messages/{encode_path_segment(email_id)}"
+    )
+    try:
+        response = helper.make_rest_call_helper(f"{message_endpoint}/attachments")
+        message_attachments = [
+            attachment
+            for attachment in response.get("value", [])
+            if attachment.get("@odata.type") == "#microsoft.graph.itemAttachment"
+        ]
+        if len(message_attachments) != 1:
+            attachment_count = len(message_attachments)
+            logger.warning(
+                f"JMR wrapper must contain exactly one message attachment; found {attachment_count}"
+            )
+            return None
+
+        attachment_id = message_attachments[0].get("id")
+        if not attachment_id:
+            logger.warning("JMR message attachment is missing an ID")
+            return None
+
+        raw_email = helper.make_rest_call_helper(
+            f"{message_endpoint}/attachments/{encode_path_segment(attachment_id)}/$value",
+            download=True,
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to download JMR embedded email: {exc}")
+        return None
+
+    return raw_email.encode("utf-8") if isinstance(raw_email, str) else raw_email
+
+
 def _extract_jmr_inner_email(
     raw_eml: str | bytes,
+    inner_raw: bytes,
+    outer_parsed: EmailData,
+    email_id: str | None,
 ) -> tuple[EmailData, FindingEmailReporter, bytes] | None:
     """Extract the direct RFC 822 child of a Microsoft JMR wrapper."""
     raw_bytes = raw_eml.encode("utf-8") if isinstance(raw_eml, str) else raw_eml
@@ -921,49 +964,47 @@ def _extract_jmr_inner_email(
     if not _is_jmr_wrapper(outer_mime) or not outer_mime.is_multipart():
         return None
 
-    for part in outer_mime.iter_parts():
-        if (
-            part.get_content_type() != "message/rfc822"
-            or part.get_content_disposition() != "attachment"
-        ):
-            continue
-
-        payload = part.get_payload()
-        if not isinstance(payload, list) or len(payload) != 1:
-            logger.warning("JMR wrapper contains an invalid message/rfc822 attachment")
-            return None
-
-        inner_message = payload[0]
-        if not isinstance(inner_message, Message):
-            logger.warning("JMR wrapper contains a non-message/rfc822 attachment")
-            return None
-
-        inner_raw = inner_message.as_bytes(policy=policy.default)
-        inner_email_id = _get_original_email_id(inner_message)
-        try:
-            inner_parsed = extract_email_data(
-                inner_raw, inner_email_id, include_attachment_content=True
-            )
-        except Exception as exc:
-            logger.warning(f"Failed to parse JMR embedded email: {exc}")
-            return None
-
-        inner_headers = inner_parsed.headers
-        body_text = inner_parsed.body.plain_text or inner_parsed.body.html or ""
-        reporter = FindingEmailReporter(
-            from_=_extract_address(inner_headers.from_address),
-            to=_extract_address(inner_headers.to),
-            cc=_extract_address(inner_headers.cc),
-            bcc=_extract_address(inner_headers.bcc),
-            subject=inner_headers.subject,
-            message_id=inner_headers.message_id,
-            id=inner_email_id,
-            body=body_text,
-            date=inner_headers.date,
+    rfc822_parts = [
+        part
+        for part in outer_mime.iter_parts()
+        if part.get_content_type() == "message/rfc822"
+    ]
+    if len(rfc822_parts) != 1:
+        child_count = len(rfc822_parts)
+        logger.warning(
+            f"JMR wrapper must contain exactly one direct message/rfc822 child; found {child_count}"
         )
-        return inner_parsed, reporter, inner_raw
+        return None
 
-    return None
+    inner_message = BytesParser(policy=policy.default).parsebytes(inner_raw)
+    inner_email_id = _get_original_email_id(inner_message)
+    try:
+        inner_parsed = extract_email_data(
+            inner_raw, inner_email_id, include_attachment_content=True
+        )
+    except Exception as exc:
+        logger.warning(f"Failed to parse JMR embedded email: {exc}")
+        return None
+
+    outer_headers = outer_parsed.headers
+    reporter_from = _extract_address(outer_headers.from_address)
+    if not reporter_from:
+        logger.warning("JMR wrapper is missing a valid reporter From address")
+        return None
+
+    body_text = outer_parsed.body.plain_text or outer_parsed.body.html or ""
+    reporter = FindingEmailReporter(
+        from_=reporter_from,
+        to=_extract_address(outer_headers.to),
+        cc=_extract_address(outer_headers.cc),
+        bcc=_extract_address(outer_headers.bcc),
+        subject=outer_headers.subject,
+        message_id=outer_headers.message_id,
+        id=email_id,
+        body=body_text,
+        date=outer_headers.date,
+    )
+    return inner_parsed, reporter, inner_raw
 
 
 def _merge_email_urls(inner_urls: list[str], outer_urls: list[str]) -> list[str]:
@@ -1097,7 +1138,16 @@ def on_es_poll(
                         if is_jmr_wrapper and getattr(
                             asset, "unwrap_jmr_reported_message", False
                         ):
-                            jmr_inner = _extract_jmr_inner_email(raw_eml)
+                            jmr_original = _download_jmr_original_email(
+                                helper, email_address, email_id
+                            )
+                            if jmr_original:
+                                jmr_inner = _extract_jmr_inner_email(
+                                    raw_eml,
+                                    jmr_original,
+                                    outer_parsed,
+                                    email_id,
+                                )
                         inner = (
                             jmr_inner[:2]
                             if jmr_inner is not None
